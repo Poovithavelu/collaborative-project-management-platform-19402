@@ -8,10 +8,13 @@
 --   - public.memberships
 --   - public.projects
 --   - public.tasks
+--   - public.comments
+--   - public.attachments
+--   - public.project_github_repos
 --
 -- RLS Model:
 --   - A user (auth_users.id) can access rows that belong to organizations they are a member of (memberships table).
---   - Access to projects and tasks is mediated via their org or project relationships.
+--   - Access to projects, tasks, comments, attachments is mediated via their org or project relationships.
 --   - org owner and admins are considered members via memberships table (001_init.sql enforces relationships).
 --
 -- Supabase Auth Integration:
@@ -61,6 +64,10 @@ alter table if exists public.organizations enable row level security;
 alter table if exists public.memberships enable row level security;
 alter table if exists public.projects enable row level security;
 alter table if exists public.tasks enable row level security;
+-- Additional domain entities
+alter table if exists public.comments enable row level security;
+alter table if exists public.attachments enable row level security;
+alter table if exists public.project_github_repos enable row level security;
 
 -- Drop existing policies if re-running migration (idempotent-friendly)
 do $$
@@ -93,6 +100,24 @@ begin
   if exists (select 1 from pg_policies where schemaname='public' and tablename='tasks') then
     execute 'drop policy if exists "tasks_org_members_read" on public.tasks';
     execute 'drop policy if exists "tasks_org_members_write_assigned_admins" on public.tasks';
+  end if;
+
+  -- comments
+  if exists (select 1 from pg_policies where schemaname='public' and tablename='comments') then
+    execute 'drop policy if exists "comments_org_members_read" on public.comments';
+    execute 'drop policy if exists "comments_owner_admin_author_write" on public.comments';
+  end if;
+
+  -- attachments
+  if exists (select 1 from pg_policies where schemaname='public' and tablename='attachments') then
+    execute 'drop policy if exists "attachments_org_members_read" on public.attachments';
+    execute 'drop policy if exists "attachments_owner_admin_uploader_write" on public.attachments';
+  end if;
+
+  -- project_github_repos
+  if exists (select 1 from pg_policies where schemaname='public' and tablename='project_github_repos') then
+    execute 'drop policy if exists "repos_org_members_read" on public.project_github_repos';
+    execute 'drop policy if exists "repos_owner_admin_write" on public.project_github_repos';
   end if;
 end$$;
 
@@ -309,6 +334,167 @@ with check (
 
 -- Example SELECT:
 --   select * from public.tasks; -- returns tasks from projects in your orgs
+
+-- ======================================================
+-- comments
+-- Schema expectation (informational):
+--   comments(id uuid pk, org_id uuid, task_id uuid, author_id uuid, content text, created_at timestamptz)
+--   FK: comments.org_id -> organizations.id, comments.task_id -> tasks.id, comments.author_id -> auth_users.id
+-- Policies:
+--   - Org members (via task->project->org) can read
+--   - Writes allowed for org owner/admin; author may update/delete own comments
+-- ======================================================
+
+create policy "comments_org_members_read"
+on public.comments
+for select
+to public
+using (
+  exists (
+    select 1
+    from public.tasks t
+    join public.projects p on p.id = t.project_id
+    join public.memberships m on m.org_id = p.org_id
+    where t.id = comments.task_id
+      and m.user_id = public.get_current_user_id()
+  )
+);
+
+create policy "comments_owner_admin_author_write"
+on public.comments
+for all
+to public
+using (
+  -- Admin/owner of org path
+  exists (
+    select 1
+    from public.tasks t
+    join public.projects p on p.id = t.project_id
+    join public.memberships m on m.org_id = p.org_id
+    where t.id = comments.task_id
+      and m.user_id = public.get_current_user_id()
+      and m.role in ('owner','admin')
+  )
+  or
+  -- Author path
+  (public.get_current_user_id() is not null and comments.author_id = public.get_current_user_id())
+)
+with check (
+  -- Ensure org admin/owner or author continues to satisfy policy after write
+  exists (
+    select 1
+    from public.tasks t
+    join public.projects p on p.id = t.project_id
+    join public.memberships m on m.org_id = p.org_id
+    where t.id = comments.task_id
+      and m.user_id = public.get_current_user_id()
+      and m.role in ('owner','admin')
+  )
+  or
+  (public.get_current_user_id() is not null and author_id = public.get_current_user_id())
+);
+
+-- ======================================================
+-- attachments
+-- Schema expectation (informational):
+--   attachments(id uuid pk, org_id uuid, task_id uuid, uploaded_by uuid, url text, created_at timestamptz, ...)
+-- Policies:
+--   - Org members (via task->project->org) can read
+--   - Writes allowed for org owner/admin; uploader may update/delete own attachments
+-- ======================================================
+
+create policy "attachments_org_members_read"
+on public.attachments
+for select
+to public
+using (
+  exists (
+    select 1
+    from public.tasks t
+    join public.projects p on p.id = t.project_id
+    join public.memberships m on m.org_id = p.org_id
+    where t.id = attachments.task_id
+      and m.user_id = public.get_current_user_id()
+  )
+);
+
+create policy "attachments_owner_admin_uploader_write"
+on public.attachments
+for all
+to public
+using (
+  -- Admin/owner of org path
+  exists (
+    select 1
+    from public.tasks t
+    join public.projects p on p.id = t.project_id
+    join public.memberships m on m.org_id = p.org_id
+    where t.id = attachments.task_id
+      and m.user_id = public.get_current_user_id()
+      and m.role in ('owner','admin')
+  )
+  or
+  -- Uploader path
+  (public.get_current_user_id() is not null and attachments.uploaded_by = public.get_current_user_id())
+)
+with check (
+  exists (
+    select 1
+    from public.tasks t
+    join public.projects p on p.id = t.project_id
+    join public.memberships m on m.org_id = p.org_id
+    where t.id = attachments.task_id
+      and m.user_id = public.get_current_user_id()
+      and m.role in ('owner','admin')
+  )
+  or
+  (public.get_current_user_id() is not null and uploaded_by = public.get_current_user_id())
+);
+
+-- ======================================================
+-- project_github_repos
+-- Schema expectation (informational):
+--   project_github_repos(id uuid pk, org_id uuid, project_id uuid, repo_full_name text, installed_at timestamptz, ...)
+-- Policies:
+--   - Org members can read
+--   - Owner/admin can write
+-- ======================================================
+
+create policy "repos_org_members_read"
+on public.project_github_repos
+for select
+to public
+using (
+  exists (
+    select 1
+    from public.memberships m
+    where m.org_id = project_github_repos.org_id
+      and m.user_id = public.get_current_user_id()
+  )
+);
+
+create policy "repos_owner_admin_write"
+on public.project_github_repos
+for all
+to public
+using (
+  exists (
+    select 1
+    from public.memberships m
+    where m.org_id = project_github_repos.org_id
+      and m.user_id = public.get_current_user_id()
+      and m.role in ('owner','admin')
+  )
+)
+with check (
+  exists (
+    select 1
+    from public.memberships m
+    where m.org_id = project_github_repos.org_id
+      and m.user_id = public.get_current_user_id()
+      and m.role in ('owner','admin')
+  )
+);
 
 -- Notes:
 -- - You may further split INSERT/UPDATE/DELETE policies if finer control is needed.
