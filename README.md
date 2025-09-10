@@ -1,1 +1,3 @@
-# collaborative-project-management-platform-19402
+# Project Repository
+
+This is the initial README file for the project.
